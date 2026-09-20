@@ -1,1 +1,4 @@
 INTERNAL-CHANGELOG.md
+.wab_gui_profiles/
+__pycache__/
+*.pyc

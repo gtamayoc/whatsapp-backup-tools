@@ -20,6 +20,7 @@ all = [
 [project.scripts]
 wab-archiver = "wab_archiver.__main__:main"
 wab-viewer = "wab_viewer.__main__:main"
+wab-gui = "wab_gui.__main__:main"
 
 [build-system]
 requires = ["setuptools>=61.0"]
