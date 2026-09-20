@@ -4,20 +4,27 @@ Combines tabs, ADB inspection card, preset manager, execution runner and theme.
 """
 
 from __future__ import annotations
+import os
 import sys
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
-    QTabWidget, QPushButton, QLabel, QFileDialog, QMessageBox, QComboBox
+    QTabWidget, QPushButton, QLabel, QFileDialog, QMessageBox, QComboBox,
+    QLineEdit, QFrame
 )
 from PySide6.QtCore import Qt, QThread, Signal
 
-from wab_gui.theme import MAIN_STYLESHEET, COLOR_DANUBE_50, COLOR_DANUBE_100, COLOR_DANUBE_200
+from wab_gui.theme import (
+    MAIN_STYLESHEET, COLOR_BLACK_50, COLOR_BLACK_100, COLOR_BLACK_200, COLOR_BLACK_500,
+    COLOR_DANUBE_50, COLOR_DANUBE_100, COLOR_DANUBE_200
+)
 from wab_gui.ui.components.device_card import DeviceCard
 from wab_gui.ui.tabs.tab_archive import TabArchive
 from wab_gui.ui.tabs.tab_restore import TabRestore
 from wab_gui.ui.tabs.tab_execution import TabExecution
+from wab_gui.ui.tabs.tab_whatsapp_content import TabWhatsAppContent
 from wab_gui.services.adb_service import AdbService
 from wab_gui.services.config_service import ConfigService
+from wab_gui.services.device_monitor import AdbDeviceMonitor
 from wab_gui.workers.runner_worker import RunnerWorker
 
 
@@ -61,12 +68,16 @@ class MainWindow(QMainWindow):
         self.current_worker: RunnerWorker | None = None
         self.adb_worker: AdbScanWorker | None = None
         self.install_worker: QThread | None = None
+        self.device_monitor: AdbDeviceMonitor | None = None
 
         self._init_ui()
         self._refresh_presets()
-        self._start_adb_scan()
+        self._setup_device_monitor()
 
     def closeEvent(self, event):
+        if self.device_monitor and self.device_monitor.isRunning():
+            self.device_monitor.stop()
+            self.device_monitor.wait(1000)
         if self.adb_worker and self.adb_worker.isRunning():
             self.adb_worker.quit()
             self.adb_worker.wait(1000)
@@ -119,15 +130,50 @@ class MainWindow(QMainWindow):
 
         # 2. ADB Device Diagnostics Card
         self.device_card = DeviceCard()
-        self.device_card.refresh_requested.connect(self._start_adb_scan)
+        self.device_card.refresh_requested.connect(self._force_device_scan)
         self.device_card.install_adb_requested.connect(self._handle_install_adb)
         main_layout.addWidget(self.device_card)
 
-        # 3. Main Tabs
+        # 3. Global Unified Output Path Bar (Single output path for all operations)
+        output_bar_frame = QFrame()
+        output_bar_frame.setObjectName("card")
+        output_bar_layout = QHBoxLayout(output_bar_frame)
+        output_bar_layout.setContentsMargins(12, 8, 12, 8)
+        output_bar_layout.setSpacing(10)
+
+        lbl_out = QLabel("📁 Ruta Única de Salida:")
+        lbl_out.setStyleSheet(f"font-weight: 700; color: {COLOR_DANUBE_50};")
+        output_bar_layout.addWidget(lbl_out)
+
+        self.txt_global_output = QLineEdit()
+        default_results_dir = os.path.abspath("results")
+        self.txt_global_output.setText(default_results_dir)
+        self.txt_global_output.setPlaceholderText("Selecciona la carpeta donde se guardarán todos los archivos...")
+        self.txt_global_output.textChanged.connect(self._on_global_output_changed)
+        output_bar_layout.addWidget(self.txt_global_output, 1)
+
+        self.btn_browse_output = QPushButton("📂 Examinar...")
+        self.btn_browse_output.clicked.connect(self._browse_global_output)
+        output_bar_layout.addWidget(self.btn_browse_output)
+
+        self.btn_open_output = QPushButton("🔍 Abrir Carpeta")
+        self.btn_open_output.clicked.connect(self._open_global_output)
+        output_bar_layout.addWidget(self.btn_open_output)
+
+        main_layout.addWidget(output_bar_frame)
+
+        # 4. Main Tabs
         self.tabs = QTabWidget()
 
+        # Featured direct & simplified WhatsApp content explorer
+        self.tab_whatsapp = TabWhatsAppContent()
+        self.tab_whatsapp.set_custom_output_root(default_results_dir)
+        self.tab_whatsapp.request_adb_scan.connect(self._force_device_scan)
+        self.tabs.addTab(self.tab_whatsapp, "📁 Contenido de WhatsApp")
+
         self.tab_archive = TabArchive()
-        self.tabs.addTab(self.tab_archive, "Archivar Multimedia")
+        self.tab_archive.picker_output.set_path(default_results_dir)
+        self.tabs.addTab(self.tab_archive, "Archivar Avanzado")
 
         self.tab_restore = TabRestore()
         self.tabs.addTab(self.tab_restore, "Restaurar Copia")
@@ -137,7 +183,7 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(self.tabs)
 
-        # 4. Bottom Execution Action Bar
+        # 5. Bottom Execution Action Bar
         bottom_bar = QHBoxLayout()
 
         self.btn_start = QPushButton("▶ Iniciar Operación")
@@ -152,18 +198,77 @@ class MainWindow(QMainWindow):
 
         bottom_bar.addStretch()
 
-        lbl_footer = QLabel("Diseño Dark Carbon • Danube Theme")
-        lbl_footer.setStyleSheet(f"color: {COLOR_DANUBE_200}; font-size: 11px;")
+        lbl_footer = QLabel("Diseño Apple Pro / iOS Minimal • Kigen.design Monochrome")
+        lbl_footer.setStyleSheet(f"color: {COLOR_BLACK_500}; font-size: 11px;")
         bottom_bar.addWidget(lbl_footer)
 
         main_layout.addLayout(bottom_bar)
 
+    def _browse_global_output(self):
+        current = self.txt_global_output.text().strip() or os.path.abspath("results")
+        folder = QFileDialog.getExistingDirectory(self, "Seleccionar Ruta de Salida Única", current)
+        if folder:
+            self.txt_global_output.setText(os.path.abspath(folder))
+
+    def _open_global_output(self):
+        target = self.txt_global_output.text().strip() or os.path.abspath("results")
+        os.makedirs(target, exist_ok=True)
+        if sys.platform == "win32":
+            os.startfile(target)
+        else:
+            import subprocess
+            cmd = "open" if sys.platform == "darwin" else "xdg-open"
+            subprocess.run([cmd, target])
+
+    def _on_global_output_changed(self, new_path: str):
+        clean_path = new_path.strip()
+        if not clean_path:
+            return
+        # Sincronizar destino en la pestaña de Contenido de WhatsApp
+        if hasattr(self, "tab_whatsapp"):
+            self.tab_whatsapp.set_custom_output_root(clean_path)
+        # Sincronizar destino en la pestaña de Archiver
+        if hasattr(self, "tab_archive") and hasattr(self.tab_archive, "picker_output"):
+            self.tab_archive.picker_output.set_path(clean_path)
+
+    def _setup_device_monitor(self):
+        self.device_monitor = AdbDeviceMonitor(poll_interval_ms=2500, parent=self)
+        self.device_monitor.device_connected.connect(self._on_device_connected)
+        self.device_monitor.device_disconnected.connect(self._on_device_disconnected)
+        self.device_monitor.no_device_detected.connect(self._on_no_device_detected)
+        self.device_monitor.adb_not_installed.connect(lambda: self.device_card.set_no_device(adb_available=False))
+        self.device_monitor.start()
+
+    def _force_device_scan(self):
+        self.device_card.status_badge.setText("Escaneando...")
+        if self.device_monitor and self.device_monitor.isRunning():
+            self.device_monitor.force_poll()
+        else:
+            self._start_adb_scan()
+
     def _start_adb_scan(self):
         self.device_card.status_badge.setText("Escaneando...")
         self.adb_worker = AdbScanWorker(self)
-        self.adb_worker.device_found.connect(self.device_card.set_device_info)
+        self.adb_worker.device_found.connect(self._on_device_connected)
         self.adb_worker.scan_failed.connect(self.device_card.set_no_device)
         self.adb_worker.start()
+
+    def _on_device_connected(self, dev_info):
+        self.device_card.set_device_info(dev_info)
+        if dev_info.state == "device":
+            adb_bin = AdbService.get_adb_path()
+            dev_name = dev_info.model or dev_info.serial
+            self.tab_whatsapp.set_device_context(adb_bin, dev_info.serial, dev_name)
+        elif dev_info.state == "unauthorized":
+            self.tab_whatsapp.clear_device_context()
+
+    def _on_device_disconnected(self, serial: str):
+        self.device_card.set_no_device(adb_available=True)
+        self.tab_whatsapp.clear_device_context()
+
+    def _on_no_device_detected(self):
+        self.device_card.set_no_device(adb_available=True)
+        self.tab_whatsapp.clear_device_context()
 
     def _handle_install_adb(self):
         from PySide6.QtWidgets import QProgressDialog

@@ -30,8 +30,8 @@ class DeviceCard(QFrame):
 
     def _init_ui(self):
         main_layout = QVBoxLayout(self)
-        main_layout.setContentsMargins(14, 12, 14, 12)
-        main_layout.setSpacing(10)
+        main_layout.setContentsMargins(12, 8, 12, 8)
+        main_layout.setSpacing(6)
 
         # Header row: Title + Status Badge + Refresh
         header_layout = QHBoxLayout()

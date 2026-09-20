@@ -29,6 +29,7 @@ class DeviceInfo:
     whatsapp_paths: Dict[str, bool] = field(default_factory=dict)
     has_msgstore_crypt: bool = False
     msgstore_size_mb: Optional[float] = None
+    profiles: List[Dict[str, str]] = field(default_factory=list)  # [{'id': '0', 'name': 'Principal'}, {'id': '999', 'name': 'MultiApp'}]
 
 
 class AdbService:
@@ -120,6 +121,9 @@ class AdbService:
         legacy_crypt = "/storage/emulated/0/WhatsApp/Databases/msgstore.db.crypt15"
         dev.has_msgstore_crypt = cls._path_exists(serial, standard_crypt) or cls._path_exists(serial, legacy_crypt)
 
+        # Android user profiles (Dual App / MultiApp / Cloned spaces)
+        dev.profiles = cls._get_profiles(serial)
+
         return dev
 
     @classmethod
@@ -187,3 +191,20 @@ class AdbService:
     def _path_exists(cls, serial: str, remote_path: str) -> bool:
         out = cls._run_cmd(serial, ["shell", f"ls -d '{remote_path}' 2>/dev/null"])
         return len(out) > 0 and "No such file" not in out
+
+    @classmethod
+    def _get_profiles(cls, serial: str) -> List[Dict[str, str]]:
+        """Parse user profiles via 'pm list users' (e.g. 0:Owner, 999:MultiApp)."""
+        out = cls._run_cmd(serial, ["shell", "pm list users"])
+        profiles = []
+        import re
+        for line in out.splitlines():
+            # UserInfo{0:Propietario:4c13} or UserInfo{999:MultiApp:4001010}
+            m = re.search(r"UserInfo\{(\d+):([^:]+):", line)
+            if m:
+                u_id = m.group(1)
+                u_name = m.group(2).strip()
+                profiles.append({"id": u_id, "name": u_name})
+        if not profiles:
+            profiles.append({"id": "0", "name": "Principal"})
+        return profiles
