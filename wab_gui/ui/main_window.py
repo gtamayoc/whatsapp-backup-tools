@@ -152,6 +152,12 @@ class MainWindow(QMainWindow):
         self.txt_global_output.textChanged.connect(self._on_global_output_changed)
         output_bar_layout.addWidget(self.txt_global_output, 1)
 
+        self.btn_output_history = QPushButton("🕒")
+        self.btn_output_history.setToolTip("Rutas de salida recientes (últimas 20)")
+        self.btn_output_history.setFixedWidth(32)
+        self.btn_output_history.clicked.connect(self._show_output_history_menu)
+        output_bar_layout.addWidget(self.btn_output_history)
+
         self.btn_browse_output = QPushButton("📂 Examinar...")
         self.btn_browse_output.clicked.connect(self._browse_global_output)
         output_bar_layout.addWidget(self.btn_browse_output)
@@ -176,7 +182,9 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self.tab_archive, "Archivar Avanzado")
 
         self.tab_restore = TabRestore()
-        self.tabs.addTab(self.tab_restore, "Restaurar Copia")
+        self.tab_restore.set_default_output(default_results_dir)
+        self.tab_restore.request_execution.connect(self._run_cli_command)
+        self.tabs.addTab(self.tab_restore, "Restaurar / Liberar Móvil")
 
         self.tab_execution = TabExecution()
         self.tabs.addTab(self.tab_execution, "Consola y Progreso")
@@ -205,10 +213,33 @@ class MainWindow(QMainWindow):
         main_layout.addLayout(bottom_bar)
 
     def _browse_global_output(self):
+        from wab_gui.services.history_service import HistoryService
         current = self.txt_global_output.text().strip() or os.path.abspath("results")
         folder = QFileDialog.getExistingDirectory(self, "Seleccionar Ruta de Salida Única", current)
         if folder:
-            self.txt_global_output.setText(os.path.abspath(folder))
+            clean = os.path.abspath(folder).replace(os.sep, "/")
+            self.txt_global_output.setText(clean)
+            HistoryService.add_path(clean, "output_dir")
+
+    def _show_output_history_menu(self):
+        from wab_gui.services.history_service import HistoryService
+        menu = QMenu(self)
+        history = HistoryService.get_history("output_dir")
+        if not history:
+            act = menu.addAction("(Sin rutas recientes)")
+            act.setEnabled(False)
+        else:
+            for p in history:
+                disp = p if len(p) <= 55 else f"...{p[-52:]}"
+                act = menu.addAction(f"📁 {disp}")
+                act.setToolTip(p)
+                act.triggered.connect(lambda checked=False, target=p: self.txt_global_output.setText(target))
+
+            menu.addSeparator()
+            act_clear = menu.addAction("🗑️ Borrar historial")
+            act_clear.triggered.connect(lambda: HistoryService.clear_history("output_dir"))
+
+        menu.exec(self.btn_output_history.mapToGlobal(self.btn_output_history.rect().bottomLeft()))
 
     def _open_global_output(self):
         target = self.txt_global_output.text().strip() or os.path.abspath("results")
@@ -221,15 +252,21 @@ class MainWindow(QMainWindow):
             subprocess.run([cmd, target])
 
     def _on_global_output_changed(self, new_path: str):
+        from wab_gui.services.history_service import HistoryService
         clean_path = new_path.strip()
         if not clean_path:
             return
+        if os.path.exists(clean_path):
+            HistoryService.add_path(clean_path, "output_dir")
         # Sincronizar destino en la pestaña de Contenido de WhatsApp
         if hasattr(self, "tab_whatsapp"):
             self.tab_whatsapp.set_custom_output_root(clean_path)
         # Sincronizar destino en la pestaña de Archiver
         if hasattr(self, "tab_archive") and hasattr(self.tab_archive, "picker_output"):
             self.tab_archive.picker_output.set_path(clean_path)
+        # Sincronizar destino en la pestaña de Restaurar / Eliminar
+        if hasattr(self, "tab_restore") and hasattr(self.tab_restore, "set_default_output"):
+            self.tab_restore.set_default_output(clean_path)
 
     def _setup_device_monitor(self):
         self.device_monitor = AdbDeviceMonitor(poll_interval_ms=2500, parent=self)
@@ -360,28 +397,38 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Error", "No se pudieron extraer claves válidas del archivo TOML.")
 
     def _start_operation(self):
-        current_tab_idx = self.tabs.currentIndex()
+        current_widget = self.tabs.currentWidget()
 
-        if current_tab_idx == 0:
+        if current_widget == self.tab_archive:
             # Archive
             cli_args = self.tab_archive.get_cli_args()
             output_dir = self.tab_archive.picker_output.get_path()
             if not output_dir:
                 QMessageBox.warning(self, "Campo Requerido", "Debe especificar un directorio de salida (-o / --output).")
                 return
-        elif current_tab_idx == 1:
-            # Restore
+        elif current_widget == self.tab_restore:
+            # Restore / Verify / Clean
             cli_args = self.tab_restore.get_cli_args()
-            output_dir = self.tab_restore.picker_output.get_path()
+            output_dir = self.tab_restore.get_output_dir()
             if not output_dir:
-                QMessageBox.warning(self, "Campo Requerido", "Debe especificar la carpeta del archivo a restaurar (-o / --output).")
+                QMessageBox.warning(self, "Campo Requerido", "Debe especificar la carpeta del archivo (-o / --output).")
                 return
+        elif current_widget == self.tab_whatsapp:
+            cli_args = self.tab_whatsapp.get_cli_args() if hasattr(self.tab_whatsapp, "get_cli_args") else None
+            if not cli_args:
+                QMessageBox.information(self, "Aviso", "Seleccione la pestaña de Archivar o Restaurar para iniciar.")
+                return
+            output_dir = self.txt_global_output.text().strip()
         else:
             QMessageBox.information(self, "Aviso", "Seleccione la pestaña de Archivar o Restaurar para iniciar.")
             return
 
+        self._run_cli_command(cli_args, output_dir)
+
+    def _run_cli_command(self, cli_args: list[str], output_dir: str):
+        """Execute a CLI command in the background runner worker."""
         # Switch to Execution Tab
-        self.tabs.setCurrentIndex(2)
+        self.tabs.setCurrentWidget(self.tab_execution)
         self.tab_execution.set_output_dir(output_dir)
         self.tab_execution.set_running(True)
         self.tab_execution.console.clear()

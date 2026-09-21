@@ -361,3 +361,73 @@ def remove_adb_pull_state(conn: sqlite3.Connection, remote_path: str,
         (remote_path, device_serial),
     )
     conn.commit()
+
+
+def sync_raw_folder_to_archive_db(output_root: str,
+                                  conn: sqlite3.Connection,
+                                  logger: logging.Logger | None = None) -> int:
+    """
+    If files exist on disk under output_root (e.g. Media/ or [Device]/Media/)
+    but the database has ZERO entries, index them automatically.
+    Returns the number of indexed files.
+    """
+    cur = conn.cursor()
+    count = cur.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+    if count > 0:
+        return 0
+
+    from shared.hashing import file_md5
+
+    indexed = 0
+    media_extensions = frozenset({
+        '.jpg', '.jpeg', '.png', '.mp4', '.3gp', '.opus', '.mp3', '.ogg',
+        '.pdf', '.doc', '.docx', '.xls', '.xlsx', '.ppt', '.pptx', '.webp', '.gif'
+    })
+
+    wa_media_folders = (
+        'whatsapp images', 'whatsapp video', 'whatsapp audio',
+        'whatsapp documents', 'whatsapp voice notes', 'whatsapp stickers',
+        'whatsapp animated gifs', 'whatsapp profile photos'
+    )
+
+    for root, _, files in os.walk(output_root):
+        lower_root = root.lower().replace(os.sep, '/')
+        if any(skip in lower_root for skip in ('databases', 'backups', 'contacts', 'groups')):
+            continue
+        for fname in files:
+            lower_name = fname.lower()
+            _, ext = os.path.splitext(lower_name)
+            if ext not in media_extensions:
+                continue
+            full_path = os.path.join(root, fname)
+            rel_path = os.path.relpath(full_path, output_root).replace(os.sep, '/')
+            lower_rel = rel_path.lower()
+
+            orig_path = None
+            if 'media/' in lower_rel:
+                idx = lower_rel.find('media/')
+                orig_path = 'Media/' + rel_path[idx + len('media/'):]
+            else:
+                for wa_f in wa_media_folders:
+                    if wa_f in lower_rel:
+                        idx = lower_rel.find(wa_f)
+                        orig_path = 'Media/' + rel_path[idx:]
+                        break
+
+            if not orig_path:
+                continue
+
+            try:
+                h = file_md5(full_path)
+                sz = os.path.getsize(full_path)
+                record_file_archived(cur, orig_path, h, rel_path, sz)
+                indexed += 1
+            except Exception as e:
+                if logger:
+                    logger.debug(f"Could not index raw file {full_path}: {e}")
+
+    if indexed > 0:
+        conn.commit()
+        if logger:
+            logger.info(f"Auto-indexed {indexed} media file(s) from disk into archive database.")
+    return indexed

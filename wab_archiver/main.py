@@ -29,6 +29,7 @@ from . import android_handler
 from . import archive_db
 from . import backup_reader
 from . import ios_handler
+from . import verifier
 from shared import db, hashing
 
 # ==============================================================================
@@ -433,12 +434,12 @@ def process_rows(rows, total: int, contacts, number_map, folder_index, group_ind
 def run_restore_mode(args, logger):
     """
     Reconstruct the original WhatsApp Media/ folder structure from the archive.
-    Queries .wa_media_archiver.db to determine original file paths and their archive copies.
-    The reconstructed tree is written to <output>/Media/.
+    Supports restoring to a local directory or directly to a connected Android phone via ADB.
     """
     conn = archive_db.open_archive_db(args.output)
     try:
         archive_db.check_db_health(conn, logger)
+        archive_db.sync_raw_folder_to_archive_db(args.output, conn, logger)
         file_count = conn.execute(
             "SELECT COUNT(DISTINCT original_path) FROM archive_copies"
         ).fetchone()[0]
@@ -468,7 +469,38 @@ def run_restore_mode(args, logger):
                 "Only Android entries (Media/...) will be restored."
             )
 
+        # Mode A: Direct restore to connected Android phone via ADB
+        if getattr(args, 'to_device', False):
+            logger.info("Restoring directly to connected Android phone via ADB...")
+            stats, report_rows = adb_extractor.push_media_to_device(
+                output_root=args.output,
+                conn=conn,
+                business=getattr(args, 'business', False),
+                dry_run=args.dry_run,
+                logger=logger,
+            )
+            if getattr(args, 'include_db', False):
+                adb_extractor.push_database_to_device(
+                    output_root=args.output,
+                    business=getattr(args, 'business', False),
+                    dry_run=args.dry_run,
+                    logger=logger,
+                )
+            restore_report_path = os.path.join(args.output, 'device_restore_report.csv')
+            if not args.dry_run and report_rows:
+                with open(restore_report_path, 'w', newline='', encoding='utf-8') as f:
+                    writer = csv.DictWriter(f, fieldnames=['original_path', 'status', 'details'])
+                    writer.writeheader()
+                    writer.writerows(report_rows)
+            logger.info("=== Device Restore Complete ===")
+            logger.info(f"  {'Restored to phone':<20}: {stats['restored']}")
+            logger.info(f"  {'Warnings / Errors':<20}: {stats['warnings']}")
+            return
+
+        # Mode B: Local filesystem reconstruction
+        target_dir = getattr(args, 'to_dir', None) or args.output
         logger.info(f"Restore data loaded: {file_count} unique original file(s).")
+        logger.info(f"Reconstructing Media/ structure to: {target_dir}")
 
         stats = {'restored': 0, 'skipped': 0, 'unrestorable': 0, 'warnings': 0}
         report_rows = []
@@ -502,7 +534,7 @@ def run_restore_mode(args, logger):
                 })
                 continue
 
-            dest = os.path.join(args.output, *original_path.split('/'))
+            dest = os.path.join(target_dir, *original_path.split('/'))
 
             if os.path.exists(dest):
                 if file_md5(src) == file_md5(dest):
@@ -541,6 +573,19 @@ def run_restore_mode(args, logger):
                     'status':              f'error: {e}',
                 })
 
+        # Include DB locally if requested
+        if getattr(args, 'include_db', False) and not args.dry_run:
+            from shared.source_detection import WA_DATABASES_DIR_NAME
+            for cand_dir in (os.path.join(args.output, WA_DATABASES_DIR_NAME), args.output):
+                if os.path.isdir(cand_dir):
+                    for fname in os.listdir(cand_dir):
+                        if fname != '.wa_media_archiver.db' and any(fname.endswith(x) for x in ('.crypt15', '.crypt14', '.crypt12', '.db')):
+                            db_dest = os.path.join(target_dir, 'Databases', fname)
+                            os.makedirs(os.path.dirname(db_dest), exist_ok=True)
+                            shutil.copy2(os.path.join(cand_dir, fname), db_dest)
+                            logger.info(f"Restored database to: {db_dest}")
+                            break
+
         if not args.dry_run:
             if report_rows:
                 fieldnames = ['original_path', 'source_archive_path', 'status']
@@ -564,6 +609,61 @@ def run_restore_mode(args, logger):
         logger.info(f"  {'Errors / Warnings':<20}: {stats['warnings']}")
         if not args.dry_run and report_rows:
             logger.info(f"  {'Restore report':<20}: {restore_report_path}")
+
+    finally:
+        conn.close()
+
+
+def run_purge_mode(args, logger):
+    """
+    Safely delete backed-up and cryptographically verified WhatsApp media from the connected phone.
+    Guarantees:
+      1. Mandatory archive verification before anything is touched.
+      2. Absolute protection of databases, keys, and unverified files on the phone.
+      3. Confirmation prompt unless -y/--yes is passed.
+    """
+    conn = archive_db.open_archive_db(args.output)
+    try:
+        archive_db.check_db_health(conn, logger)
+
+        if not getattr(args, 'yes', False) and not args.dry_run:
+            confirm = input(
+                "WARNING: This will permanently delete backed-up media from your connected PHONE\n"
+                "to free up storage space. Your PC backup will remain completely intact.\n"
+                "Are you sure you want to proceed? [y/N]: "
+            )
+            if confirm.strip().lower() not in ('y', 'yes'):
+                logger.info("Operation aborted by user.")
+                return
+
+        stats, audit_rows = adb_extractor.purge_device_media(
+            output_root=args.output,
+            conn=conn,
+            business=getattr(args, 'business', False),
+            dry_run=args.dry_run,
+            logger=logger,
+        )
+
+        report_path = os.path.join(args.output, 'device_purge_report.csv')
+        if audit_rows:
+            fieldnames = ['remote_path', 'status', 'size', 'md5', 'timestamp']
+            with open(report_path, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=fieldnames)
+                writer.writeheader()
+                writer.writerows(audit_rows)
+            logger.info(f"Device purge report written to: {report_path}")
+
+        mb_freed = stats['bytes_freed'] / (1024 * 1024)
+        logger.info("=== Device Purge Summary ===")
+        logger.info(f"  {'Remote files scanned':<25}: {stats['scanned']}")
+        logger.info(f"  {'Protected (databases/keys)':<25}: {stats['protected_skipped']}")
+        logger.info(f"  {'Unarchived (kept on phone)':<25}: {stats['unarchived_skipped']}")
+        logger.info(f"  {'Mismatches / missing copy':<25}: {stats['mismatched_skipped'] + stats['missing_pc_copy_skipped']}")
+        if args.dry_run:
+            logger.info(f"  {'Eligible to delete (DRY RUN)':<25}: {stats['eligible']} ({mb_freed:.2f} MB)")
+        else:
+            logger.info(f"  {'Deleted from phone':<25}: {stats['deleted']} ({mb_freed:.2f} MB freed)")
+        logger.info(f"  {'Errors':<25}: {stats['errors']}")
 
     finally:
         conn.close()
@@ -652,7 +752,7 @@ def _generate_config(script_dir: str):
 # Entry point
 # ---------------------------------------------------------------------------
 
-_KNOWN_COMMANDS = frozenset({'archive', 'restore', 'config'})
+_KNOWN_COMMANDS = frozenset({'archive', 'restore', 'config', 'verify', 'purge-device', 'free-space'})
 
 
 def _inject_default_archive_command():
@@ -870,6 +970,22 @@ def parse_args() -> argparse.Namespace:
         help='Path to the archive to restore.',
     )
     restore_p.add_argument(
+        '--to-device', action='store_true',
+        help='Push restored files directly to connected Android phone via ADB.',
+    )
+    restore_p.add_argument(
+        '--to-dir', default=None, metavar='PATH',
+        help='Custom local folder where reconstructed Media/ structure is written (defaults to <output>).',
+    )
+    restore_p.add_argument(
+        '--include-db', action='store_true',
+        help='Also restore encrypted WhatsApp database (msgstore.db.cryptXX) to Databases/.',
+    )
+    restore_p.add_argument(
+        '--business', action='store_true',
+        help='Target WhatsApp Business package on device.',
+    )
+    restore_p.add_argument(
         '-l', '--log', default=None, metavar='PATH',
         help='Log file path.',
     )
@@ -891,6 +1007,63 @@ def parse_args() -> argparse.Namespace:
         help='generate: write example-config.toml to the script folder.',
     )
 
+    # --- verify ---
+    verify_p = subs.add_parser(
+        'verify',
+        help='Verify the cryptographic integrity of an archive against its database and/or source.',
+    )
+    verify_p.add_argument(
+        '-o', '--output', default=None, metavar='PATH',
+        help='Path to the archive directory to verify.',
+    )
+    verify_p.add_argument(
+        '--source', '--wa-root', dest='source', default=None, metavar='PATH',
+        help='Optional path to original WhatsApp source directory to verify parity.',
+    )
+    verify_p.add_argument(
+        '-l', '--log', default=None, metavar='PATH',
+        help='Log file path.',
+    )
+    verify_p.add_argument(
+        '--config', default=None, metavar='PATH',
+        help='Path to a TOML config file.',
+    )
+    _verify_config = {k: v for k, v in _config.items() if k in ('output', 'log')}
+    verify_p.set_defaults(**_verify_config)
+
+    # --- purge-device / free-space ---
+    purge_p = subs.add_parser(
+        'purge-device',
+        aliases=['free-space'],
+        help='Safely free up storage on the connected phone by deleting verified, backed-up media.',
+    )
+    purge_p.add_argument(
+        '-o', '--output', default=None, metavar='PATH',
+        help='Path to the archive directory containing .wa_media_archiver.db.',
+    )
+    purge_p.add_argument(
+        '--business', action='store_true',
+        help='Target WhatsApp Business media on the phone.',
+    )
+    purge_p.add_argument(
+        '-y', '--yes', action='store_true',
+        help='Skip interactive confirmation prompt.',
+    )
+    purge_p.add_argument(
+        '--dry-run', action='store_true',
+        help='Simulate phone cleanup: calculate and display bytes/files to be freed without deleting anything.',
+    )
+    purge_p.add_argument(
+        '-l', '--log', default=None, metavar='PATH',
+        help='Log file path.',
+    )
+    purge_p.add_argument(
+        '--config', default=None, metavar='PATH',
+        help='Path to a TOML config file.',
+    )
+    _purge_config = {k: v for k, v in _config.items() if k in ('output', 'log')}
+    purge_p.set_defaults(**_purge_config)
+
     # -------------------------------------------------------------------------
     # Parse
     # -------------------------------------------------------------------------
@@ -903,6 +1076,16 @@ def parse_args() -> argparse.Namespace:
     if args.command == 'restore':
         if not args.output:
             restore_p.error("the following arguments are required: -o/--output")
+        return args
+
+    if args.command == 'verify':
+        if not args.output:
+            verify_p.error("the following arguments are required: -o/--output")
+        return args
+
+    if args.command in ('purge-device', 'free-space'):
+        if not args.output:
+            purge_p.error("the following arguments are required: -o/--output")
         return args
 
     # --- archive validation ---
@@ -931,9 +1114,19 @@ def parse_args() -> argparse.Namespace:
 
 def _warn_network_paths(args: argparse.Namespace, logger: logging.Logger):
     """Warn if output or any wa_root appear to be UNC network share paths."""
-    roots = args.wa_roots or []
-    for label, path in [('--output', args.output)] + [('--wa-root', r) for r in roots]:
-        if path and (path.startswith('\\\\') or path.startswith('//')):
+    roots = getattr(args, 'wa_roots', None) or []
+    output = getattr(args, 'output', None)
+    source = getattr(args, 'source', None)
+    paths_to_check = []
+    if output:
+        paths_to_check.append(('--output', output))
+    if source:
+        paths_to_check.append(('--source', source))
+    for r in roots:
+        if r:
+            paths_to_check.append(('--wa-root', r))
+    for label, path in paths_to_check:
+        if path and (str(path).startswith('\\\\') or str(path).startswith('//')):
             logger.warning(
                 f"{label} appears to be a network share ({path}). "
                 "Performance may be degraded and file timestamps may not be preserved."
@@ -1361,6 +1554,18 @@ def main():
         if args.dry_run:
             logger.info("*** DRY RUN MODE — no files will be copied ***")
         run_restore_mode(args, logger)
+        return
+
+    if args.command == 'verify':
+        logger.info(f"=== WhatsApp Backup Tools — Archiver v{_get_version()} started (verify mode) ===")
+        verifier.run_verify_mode(args, logger)
+        return
+
+    if args.command in ('purge-device', 'free-space'):
+        logger.info(f"=== WhatsApp Backup Tools — Archiver v{_get_version()} started (device purge mode) ===")
+        if args.dry_run:
+            logger.info("*** DRY RUN MODE — no files will be deleted from phone ***")
+        run_purge_mode(args, logger)
         return
 
     if args.dry_run:
